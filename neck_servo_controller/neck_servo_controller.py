@@ -1,9 +1,9 @@
-# Publish the angle to topic /neck_angle, data type is !!!string!!!
+
 #!/usr/bin/env python3
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float32
 from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
 
 
@@ -17,25 +17,23 @@ class NeckServoController(Node):
 
     # Servo configuration
     DXL_ID = 1
-    BAUDRATE = 57600
+    BAUDRATE = 115200
     PORT = "/dev/ttyUSB0"
 
-    # Preset angles relative to home
-    PRESET_ANGLES = {
-        "0": 0,
-        "30": 30,
-        "45": 45,
-        "90": 15,
-    }
-
+    # Position configuration
     HOME_TICK = 2048
     DIRECTION = 1
+
+    # Angle safety limits (degrees relative to home)
+    MIN_ANGLE = -180.0
+    MAX_ANGLE = 180.0
 
     def __init__(self):
         super().__init__("neck_servo_controller")
 
         self.port = PortHandler(self.PORT)
         self.packet = PacketHandler(2.0)
+
         self.connected = False
         self.torque_enabled = False
 
@@ -51,6 +49,7 @@ class NeckServoController(Node):
             model, result, error = self.packet.ping(
                 self.port, self.DXL_ID
             )
+
             self.check_result(result, error)
 
             self.get_logger().info(
@@ -59,6 +58,8 @@ class NeckServoController(Node):
 
             # Disable torque before changing operating mode
             self.write1(self.ADDR_TORQUE_ENABLE, 0)
+
+            # Position Control Mode
             self.write1(self.ADDR_OPERATING_MODE, 3)
 
             # Set profile velocity
@@ -68,8 +69,9 @@ class NeckServoController(Node):
             self.write1(self.ADDR_TORQUE_ENABLE, 1)
             self.torque_enabled = True
 
+            # Subscribe to angle values
             self.subscription = self.create_subscription(
-                String,
+                Float32,
                 "/neck_angle",
                 self.command_callback,
                 10
@@ -77,7 +79,7 @@ class NeckServoController(Node):
 
             self.get_logger().info(
                 "Neck controller ready. "
-                "Listening to /neck_angle"
+                "Listening to /neck_angle (Float32)"
             )
 
         except Exception:
@@ -85,28 +87,35 @@ class NeckServoController(Node):
             raise
 
     def check_result(self, result, error):
+
         if result != COMM_SUCCESS:
             raise RuntimeError(
                 self.packet.getTxRxResult(result)
             )
+
         if error != 0:
             raise RuntimeError(
                 self.packet.getRxPacketError(error)
             )
 
     def write1(self, address, value):
+
         result, error = self.packet.write1ByteTxRx(
             self.port, self.DXL_ID, address, value
         )
+
         self.check_result(result, error)
 
     def write4(self, address, value):
+
         result, error = self.packet.write4ByteTxRx(
             self.port, self.DXL_ID, address, value
         )
+
         self.check_result(result, error)
 
     def angle_to_tick(self, angle):
+
         tick = self.HOME_TICK + round(
             self.DIRECTION * angle * 4096 / 360
         )
@@ -119,23 +128,29 @@ class NeckServoController(Node):
         return tick
 
     def command_callback(self, msg):
-        command = msg.data.strip().lower()
 
-        if command not in self.PRESET_ANGLES:
+        angle = float(msg.data)
+
+        # Check angle limits
+        if not self.MIN_ANGLE <= angle <= self.MAX_ANGLE:
             self.get_logger().warn(
-                f"Unknown neck command: {command}"
+                f"Angle {angle} is outside allowed limits "
+                f"({self.MIN_ANGLE} to {self.MAX_ANGLE})"
             )
             return
 
-        angle = self.PRESET_ANGLES[command]
-        goal_tick = self.angle_to_tick(angle)
-
         try:
-            self.write4(self.ADDR_GOAL_POSITION, goal_tick)
+            goal_tick = self.angle_to_tick(angle)
+
+            self.write4(
+                self.ADDR_GOAL_POSITION,
+                goal_tick
+            )
 
             self.get_logger().info(
-                f"Moving neck: {command}, "
-                f"angle={angle} deg, tick={goal_tick}"
+                f"Moving neck: "
+                f"angle={angle:.2f} deg, "
+                f"tick={goal_tick}"
             )
 
         except Exception as e:
@@ -144,10 +159,13 @@ class NeckServoController(Node):
             )
 
     def shutdown(self):
+
         if self.connected:
+
             if self.torque_enabled:
                 try:
                     self.write1(self.ADDR_TORQUE_ENABLE, 0)
+
                 except Exception as e:
                     self.get_logger().error(str(e))
 
@@ -158,7 +176,9 @@ class NeckServoController(Node):
 
 
 def main(args=None):
+
     rclpy.init(args=args)
+
     node = None
 
     try:

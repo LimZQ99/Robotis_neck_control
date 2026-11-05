@@ -3,17 +3,21 @@
 
 import rclpy
 from rclpy.node import Node
+
 from std_msgs.msg import Float32
+from sensor_msgs.msg import JointState
+
 from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
 
 
 class NeckServoController(Node):
 
-    # XM430-W350-T control table
+    # XM430-W350-T Control Table
     ADDR_TORQUE_ENABLE = 64
     ADDR_OPERATING_MODE = 11
     ADDR_GOAL_POSITION = 116
     ADDR_PROFILE_VELOCITY = 112
+    ADDR_PRESENT_POSITION = 132
 
     # Servo configuration
     DXL_ID = 1
@@ -27,6 +31,15 @@ class NeckServoController(Node):
     # Angle safety limits (degrees relative to home)
     MIN_ANGLE = -180.0
     MAX_ANGLE = 180.0
+
+    # Encoder configuration
+    TICKS_PER_REVOLUTION = 4096
+
+    # Joint configuration
+    JOINT_NAME = "head_joint"
+
+    # Publishing frequency
+    PUBLISH_RATE = 50.0
 
     def __init__(self):
         super().__init__("neck_servo_controller")
@@ -69,7 +82,7 @@ class NeckServoController(Node):
             self.write1(self.ADDR_TORQUE_ENABLE, 1)
             self.torque_enabled = True
 
-            # Subscribe to angle values
+            # Subscribe to neck angle commands
             self.subscription = self.create_subscription(
                 Float32,
                 "/neck_angle",
@@ -77,9 +90,25 @@ class NeckServoController(Node):
                 10
             )
 
+            # Publish actual joint states
+            self.joint_state_pub = self.create_publisher(
+                JointState,
+                "/joint_states",
+                10
+            )
+
+            # Timer for reading actual servo position
+            self.joint_state_timer = self.create_timer(
+                1.0 / self.PUBLISH_RATE,
+                self.publish_joint_state
+            )
+
             self.get_logger().info(
-                "Neck controller ready. "
-                "Listening to /neck_angle (Float32)"
+                "Neck controller ready.\n"
+                "Listening: /neck_angle (Float32)\n"
+                "Publishing: /joint_states (JointState)\n"
+                f"Joint name: {self.JOINT_NAME}\n"
+                f"Publishing rate: {self.PUBLISH_RATE} Hz"
             )
 
         except Exception:
@@ -114,10 +143,21 @@ class NeckServoController(Node):
 
         self.check_result(result, error)
 
+    def read4(self, address):
+
+        value, result, error = self.packet.read4ByteTxRx(
+            self.port, self.DXL_ID, address
+        )
+
+        self.check_result(result, error)
+
+        return value
+
     def angle_to_tick(self, angle):
 
         tick = self.HOME_TICK + round(
-            self.DIRECTION * angle * 4096 / 360
+            self.DIRECTION * angle *
+            self.TICKS_PER_REVOLUTION / 360.0
         )
 
         if not 0 <= tick <= 4095:
@@ -127,11 +167,22 @@ class NeckServoController(Node):
 
         return tick
 
+    def tick_to_angle(self, tick):
+
+        # Convert encoder ticks into degrees relative to home
+        angle = (
+            (tick - self.HOME_TICK)
+            * 360.0 / self.TICKS_PER_REVOLUTION
+        )
+
+        angle *= self.DIRECTION
+
+        return angle
+
     def command_callback(self, msg):
 
         angle = float(msg.data)
 
-        # Check angle limits
         if not self.MIN_ANGLE <= angle <= self.MAX_ANGLE:
             self.get_logger().warn(
                 f"Angle {angle} is outside allowed limits "
@@ -158,13 +209,49 @@ class NeckServoController(Node):
                 f"Failed to move neck: {e}"
             )
 
+    def publish_joint_state(self):
+
+        try:
+            # Read actual servo position
+            present_tick = self.read4(
+                self.ADDR_PRESENT_POSITION
+            )
+
+            # Convert ticks to degrees
+            angle_deg = self.tick_to_angle(present_tick)
+
+            # Convert degrees to radians for ROS
+            angle_rad = angle_deg * 3.141592653589793 / 180.0
+
+            # Create JointState message
+            msg = JointState()
+
+            msg.header.stamp = self.get_clock().now().to_msg()
+
+            msg.name = [self.JOINT_NAME]
+            msg.position = [angle_rad]
+
+            # Velocity and effort are not measured here
+            msg.velocity = []
+            msg.effort = []
+
+            self.joint_state_pub.publish(msg)
+
+        except Exception as e:
+            self.get_logger().error(
+                f"Failed to read/publish joint state: {e}",
+                throttle_duration_sec=2.0
+            )
+
     def shutdown(self):
 
         if self.connected:
 
             if self.torque_enabled:
                 try:
-                    self.write1(self.ADDR_TORQUE_ENABLE, 0)
+                    self.write1(
+                        self.ADDR_TORQUE_ENABLE, 0
+                    )
 
                 except Exception as e:
                     self.get_logger().error(str(e))
